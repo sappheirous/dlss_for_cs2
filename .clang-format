@@ -1,0 +1,27 @@
+Language: Cpp
+BasedOnStyle: Google
+Standard: Latest
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+AccessModifierOffset: -4
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+SortIncludes: CaseSensitive
+MainIncludeChar: Any
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: "^<[a-z_]+>$"
+    Priority: 1
+  - Regex: "^<remora/"
+    Priority: 3
+  - Regex: "^<"
+    Priority: 2
+  - Regex: ".*"
+    Priority: 3
+
+IncludeIsMainRegex: "(_test)?$"

@@ -1,0 +1,9 @@
+{
+  "name": "cs2-dlss",
+  "dependencies": [
+    { "name": "imgui", "features": ["win32-binding", "dx11-binding"] },
+    "minhook",
+    "spdlog",
+    "simpleini"
+  ]
+}

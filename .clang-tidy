@@ -1,0 +1,71 @@
+# Scope: naming and selected code-style checks.
+
+Checks: >
+  -*,
+  readability-identifier-naming,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-using,
+  google-readability-casting,
+  performance-avoid-endl
+
+# Only diagnose project headers.
+HeaderFilterRegex: 'src[/\\].*'
+
+FormatStyle: file
+
+CheckOptions:
+  # Namespaces: snake_case.
+  - { key: readability-identifier-naming.NamespaceCase,                 value: lower_case }
+
+  # Types: PascalCase.
+  - { key: readability-identifier-naming.ClassCase,                     value: CamelCase }
+  - { key: readability-identifier-naming.StructCase,                    value: CamelCase }
+  - { key: readability-identifier-naming.UnionCase,                     value: CamelCase }
+  - { key: readability-identifier-naming.EnumCase,                      value: CamelCase }
+  - { key: readability-identifier-naming.TypeAliasCase,                 value: CamelCase }
+  - { key: readability-identifier-naming.TypedefCase,                   value: CamelCase }
+  - { key: readability-identifier-naming.ConceptCase,                   value: CamelCase }
+  - { key: readability-identifier-naming.TemplateParameterCase,         value: CamelCase }
+  - { key: readability-identifier-naming.TypeTemplateParameterCase,     value: CamelCase }
+  - { key: readability-identifier-naming.TemplateTemplateParameterCase, value: CamelCase }
+
+  # Enum class values: PascalCase (ErrorCode::SignatureNotFound).
+  - { key: readability-identifier-naming.EnumConstantCase,              value: CamelCase }
+  - { key: readability-identifier-naming.ScopedEnumConstantCase,        value: CamelCase }
+
+  - { key: readability-identifier-naming.FunctionIgnoredRegexp, value: '^(DllMain|ImGui_Impl.*)$' }
+
+  # Functions and methods: snake_case (scan_pattern, render_overlay).
+  - { key: readability-identifier-naming.FunctionCase,                  value: lower_case }
+  - { key: readability-identifier-naming.MethodCase,                    value: lower_case }
+  - { key: readability-identifier-naming.ClassMethodCase,               value: lower_case }
+
+  # Locals and parameters: snake_case.
+  - { key: readability-identifier-naming.VariableCase,                  value: lower_case }
+  - { key: readability-identifier-naming.LocalVariableCase,             value: lower_case }
+  - { key: readability-identifier-naming.ParameterCase,                 value: lower_case }
+  - { key: readability-identifier-naming.GlobalVariableCase,            value: lower_case }
+
+  # Private/protected members: snake_case with a trailing underscore.
+  - { key: readability-identifier-naming.PrivateMemberCase,             value: lower_case }
+  - { key: readability-identifier-naming.PrivateMemberSuffix,           value: _ }
+  - { key: readability-identifier-naming.ProtectedMemberCase,           value: lower_case }
+  - { key: readability-identifier-naming.ProtectedMemberSuffix,         value: _ }
+
+  # Public aggregate members: snake_case without a suffix.
+  - { key: readability-identifier-naming.PublicMemberCase,              value: lower_case }
+
+  # Compile-time constants: snake_case (max_pattern_len).
+  - { key: readability-identifier-naming.ConstexprVariableCase,         value: lower_case }
+  - { key: readability-identifier-naming.GlobalConstantCase,            value: lower_case }
+  - { key: readability-identifier-naming.StaticConstantCase,            value: lower_case }
+  - { key: readability-identifier-naming.ClassConstantCase,             value: lower_case }
+
+  # Project macros: CS2_DLSS_UPPER_SNAKE_CASE.
+  - { key: readability-identifier-naming.MacroDefinitionCase,           value: UPPER_CASE }
+
+  - { key: readability-identifier-naming.MacroDefinitionPrefix, value: CS2_DLSS_ }
+
+  # External Dear ImGui API tokens.
+  - { key: readability-identifier-naming.MacroDefinitionIgnoredRegexp,  value: '^(ImGui_Impl.*|ShowDemoWindow)$' }

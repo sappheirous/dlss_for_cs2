@@ -1,0 +1,38 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "msvc-x64",
+      "displayName": "msvc-x64",
+      "generator": "Ninja Multi-Config",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_DEFAULT_BUILD_TYPE": { "type": "STRING", "value": "Release" },
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "CMAKE_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        },
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "msvc-x64-debug",
+      "displayName": "debug",
+      "configurePreset": "msvc-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "msvc-x64-release",
+      "displayName": "release",
+      "configurePreset": "msvc-x64",
+      "configuration": "Release"
+    }
+  ]
+}
