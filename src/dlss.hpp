@@ -2,13 +2,14 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <type_traits>
-#include <unordered_map>
 
+#include <d3d11.h>
 #include <wrl/client.h>
 
 #include "game_types.hpp"
@@ -23,26 +24,36 @@ using Microsoft::WRL::ComPtr;
 struct ViewMatrices {
     Matrix4 view_projection;
     Matrix4 inv_view_projection;
-    Matrix4 rev_z_view_projection;
-    Matrix4 inv_rev_z_view_projection;
 };
 
-struct ViewHistory {
-    std::uint32_t frame;
-    ViewMatrices current;
-    ViewMatrices previous;
+struct ViewIdentity {
+    std::uint64_t name_hash;
+    std::uint64_t key;
+    std::uint32_t subkey;
+
+    bool operator==(const ViewIdentity&) const = default;
+};
+
+struct CameraState {
+    Vec3 origin;
+    Vec3 angles;
+    float fov_x;
+    float aspect;
+    float near_plane;
+    float far_plane;
 };
 
 struct ViewRecord {
     void* view;
-    std::uint64_t name_hash;
+    ViewIdentity identity;
+    std::uint32_t frame;
     std::int64_t depth_target;
 
-    float jitter_x;
-    float jitter_y;
+    float jitter_ndc_x;
+    float jitter_ndc_y;
 
     ViewMatrices current;
-    ViewMatrices previous;
+    CameraState camera;
 };
 
 struct LayerRecord {
@@ -59,8 +70,10 @@ struct Dispatch {
     ID3D11ShaderResourceView* output_view;
     ID3D11ShaderResourceView* depth_view;
 
-    Matrix4 inv_view_projection;
-    Matrix4 prev_view_projection;
+    ViewMatrices matrices;
+    CameraState camera;
+    ViewIdentity identity;
+    std::uint32_t frame;
 
     float jitter_x;
     float jitter_y;
@@ -79,11 +92,21 @@ struct ShaderConstants {
 
     float viewport[4];
     float params[4];
+    float jitter[4];
 };
 
-static_assert(sizeof(ShaderConstants) == 96);
+static_assert(sizeof(ShaderConstants) == 112);
+static_assert(offsetof(ShaderConstants, viewport) == 64);
+static_assert(offsetof(ShaderConstants, params) == 80);
+static_assert(offsetof(ShaderConstants, jitter) == 96);
 
-enum class DepthConvention : int { Unknown = 0, Standard, Reversed };
+struct EvaluationHistory {
+    ViewMatrices matrices;
+    CameraState camera;
+    ViewIdentity identity;
+    std::uint32_t frame;
+    std::chrono::steady_clock::time_point time;
+};
 
 class RenderExecutor {
 public:
@@ -108,9 +131,9 @@ public:
 
 class DlssRenderer {
 public:
-    bool build_jittered_frustum(const char* debug_name, const Frustum* frustum, Frustum* jittered_frustum,
-                                float* jitter_x, float* jitter_y);
-    void on_add_view(void* view, const char* debug_name, const Frustum* frustum, float jitter_x, float jitter_y);
+    bool build_jittered_frustum(const char* debug_name, const Frustum* frustum, Frustum* jittered_frustum);
+    void on_add_view(void* view, const char* debug_name, const void* view_id, const Frustum* frustum,
+                     float jitter_ndc_x, float jitter_ndc_y);
     void on_finish_rendering_views();
     void on_add_upscale_layers(const UpscaleLayersContext* context);
     bool on_upscale_render(FsrUpscaleRenderer* renderer, void* render_context, void* scene_layer, bool native_rendered);
@@ -143,7 +166,6 @@ private:
     bool create_resources(ID3D11DeviceContext* device_context, const Dispatch& dispatch,
                           const D3D11_TEXTURE2D_DESC& color_desc, const D3D11_TEXTURE2D_DESC& output_desc);
     bool dispatch_motion_vectors(ID3D11DeviceContext* device_context, const Dispatch& dispatch);
-    void detect_depth_convention(ID3D11DeviceContext* device_context, const Dispatch& dispatch);
     void release_feature();
     void release_parameters();
     void fail(const char* message, std::uint32_t result = 0);
@@ -154,8 +176,9 @@ private:
     std::array<LayerRecord, 8> layers_ = {};
     std::size_t next_layer_ = 0;
     std::uint32_t frame_ = 0;
-    std::unordered_map<std::uint64_t, ViewHistory> view_history_;
-    std::unordered_map<std::uint64_t, int> view_calls_;
+    std::optional<std::uint32_t> jitter_frame_;
+    std::uint64_t jitter_generation_ = 0;
+    std::array<float, 2> frame_jitter_{};
 
     std::atomic_bool retry_requested_{false};
     std::atomic_uint32_t display_changes_{0};
@@ -163,7 +186,6 @@ private:
     std::atomic_uint64_t resource_generation_{0};
     std::atomic_bool unavailable_ = false;
     std::atomic_bool feature_created_ = false;
-    std::atomic<DepthConvention> depth_convention_ = DepthConvention::Unknown;
     std::atomic_int last_output_height_ = 0;
     std::atomic_int last_render_width_ = 0;
     std::atomic_int last_render_height_ = 0;
@@ -175,7 +197,7 @@ private:
     bool reset_ = true;
     bool direct_color_ = false;
     bool direct_output_ = false;
-    bool depth_readback_pending_ = false;
+    std::optional<EvaluationHistory> evaluation_history_;
 
     NVSDK_NGX_Parameter* parameters_ = nullptr;
     NVSDK_NGX_Handle* feature_ = nullptr;
@@ -197,7 +219,6 @@ private:
     ComPtr<ID3D11Texture2D> color_copy_texture_;
     ComPtr<ID3D11Texture2D> depth_texture_;
     ComPtr<ID3D11Texture2D> motion_vectors_texture_;
-    ComPtr<ID3D11Texture2D> depth_readback_texture_;
     ComPtr<ID3D11UnorderedAccessView> depth_view_;
     ComPtr<ID3D11UnorderedAccessView> motion_vectors_view_;
 

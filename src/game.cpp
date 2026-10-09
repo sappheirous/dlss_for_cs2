@@ -301,11 +301,11 @@ void* __fastcall hk_add_view(void* scene_system, const char* name, void* view_id
                              void* swap_chain, void* world, const RenderViewport* viewport, const void* vis,
                              std::uint32_t priority) {
     Frustum jittered{};
-    float jitter_x = 0.0f, jitter_y = 0.0f;
-    const bool use_jitter = renderer().build_jittered_frustum(name, frustum, &jittered, &jitter_x, &jitter_y);
-    auto view = o_add_view(scene_system, name, view_id, use_jitter ? &jittered : frustum, swap_chain, world, viewport,
-                           vis, priority);
-    renderer().on_add_view(view, name, frustum, jitter_x, jitter_y);
+    const bool use_jitter = renderer().build_jittered_frustum(name, frustum, &jittered);
+    const auto* render_frustum = use_jitter ? &jittered : frustum;
+    auto view = o_add_view(scene_system, name, view_id, render_frustum, swap_chain, world, viewport, vis, priority);
+    if (render_frustum)
+        renderer().on_add_view(view, name, view_id, frustum, render_frustum->jitter_x, render_frustum->jitter_y);
     return view;
 }
 

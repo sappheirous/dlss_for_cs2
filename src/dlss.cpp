@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -66,6 +68,45 @@ bool matches_render_scale(const Dispatch& dispatch) {
            std::abs(dispatch.source_viewport.height - dispatch.destination_viewport.height * scale) <= 2.0f;
 }
 
+bool same_viewport(const RenderViewport& left, const RenderViewport& right) noexcept {
+    // The leading version/tag is not part of the reconstruction rectangle.
+    return left.top_left_x == right.top_left_x && left.top_left_y == right.top_left_y && left.width == right.width &&
+           left.height == right.height && left.min_z == right.min_z && left.max_z == right.max_z;
+}
+
+bool valid_matrix(const Matrix4& matrix) noexcept {
+    for (const auto& row : matrix.m)
+        for (const float value : row)
+            if (!std::isfinite(value)) return false;
+
+    return true;
+}
+
+bool valid_camera(const CameraState& camera) noexcept {
+    for (const float value :
+         std::array{camera.origin.x, camera.origin.y, camera.origin.z, camera.angles.x, camera.angles.y,
+                    camera.angles.z, camera.fov_x, camera.aspect, camera.near_plane, camera.far_plane})
+        if (!std::isfinite(value)) return false;
+
+    return camera.fov_x > 0.0f && camera.fov_x < 180.0f && camera.aspect > 0.0f;
+}
+
+bool camera_cut(const CameraState& current, const CameraState& previous) noexcept {
+    const float x = current.origin.x - previous.origin.x;
+    const float y = current.origin.y - previous.origin.y;
+    const float z = current.origin.z - previous.origin.z;
+    // Large discontinuities should discard history rather than drag it across the new view.
+    if (x * x + y * y + z * z > 128.0f * 128.0f) return true;
+
+    const auto angle_changed = [](float current_angle, float previous_angle) {
+        return std::abs(std::remainder(current_angle - previous_angle, 360.0f)) > 45.0f;
+    };
+    return angle_changed(current.angles.x, previous.angles.x) || angle_changed(current.angles.y, previous.angles.y) ||
+           angle_changed(current.angles.z, previous.angles.z) || std::abs(current.fov_x - previous.fov_x) > 1.0f ||
+           std::abs(current.aspect - previous.aspect) > 0.001f || current.near_plane != previous.near_plane ||
+           current.far_plane != previous.far_plane;
+}
+
 DXGI_FORMAT typed_color_format(DXGI_FORMAT format) {
     switch (format) {
         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
@@ -103,11 +144,28 @@ float halton(std::uint32_t index, std::uint32_t base) {
 Matrix4 multiply(const Matrix4& left, const Matrix4& right) noexcept {
     Matrix4 result{};
     for (int row = 0; row < 4; ++row)
-        for (int column = 0; column < 4; ++column)
+        for (int column = 0; column < 4; ++column) {
+            double value = 0.0;
             for (int index = 0; index < 4; ++index)
-                result.m[row][column] += left.m[row][index] * right.m[index][column];
+                value += static_cast<double>(left.m[row][index]) * right.m[index][column];
+            result.m[row][column] = static_cast<float>(value);
+        }
 
     return result;
+}
+
+void remove_jitter(Matrix4& projection, Matrix4& inverse, float jitter_x, float jitter_y) noexcept {
+    if (jitter_x == 0.0f && jitter_y == 0.0f) return;
+
+    for (int column = 0; column < 4; ++column) {
+        projection.m[0][column] = static_cast<float>(static_cast<double>(projection.m[0][column]) -
+                                                     static_cast<double>(projection.m[3][column]) * jitter_x);
+        projection.m[1][column] = static_cast<float>(static_cast<double>(projection.m[1][column]) -
+                                                     static_cast<double>(projection.m[3][column]) * jitter_y);
+    }
+    for (auto& row : inverse.m)
+        row[3] = static_cast<float>(static_cast<double>(row[3]) + static_cast<double>(row[0]) * jitter_x +
+                                    static_cast<double>(row[1]) * jitter_y);
 }
 
 }  // namespace
@@ -131,11 +189,7 @@ void LayerRenderer::render(void*, void* render_context, void* scene_layer) {
     renderer().on_native_render(render_context, scene_layer);
 }
 
-bool DlssRenderer::build_jittered_frustum(const char* debug_name, const Frustum* frustum, Frustum* jittered_frustum,
-                                          float* jitter_x, float* jitter_y) {
-    *jitter_x = 0.0f;
-    *jitter_y = 0.0f;
-
+bool DlssRenderer::build_jittered_frustum(const char* debug_name, const Frustum* frustum, Frustum* jittered_frustum) {
     const int render_width = last_render_width_;
     const int render_height = last_render_height_;
     const int output_height = last_output_height_;
@@ -147,14 +201,23 @@ bool DlssRenderer::build_jittered_frustum(const char* debug_name, const Frustum*
 
     const float ratio = static_cast<float>(output_height) / static_cast<float>(render_height);
     const std::uint32_t phase_count = static_cast<std::uint32_t>(std::ceil(8.0f * ratio * ratio));
-    const std::uint32_t phase = jitter_index_++ % phase_count + 1;
+    std::array<float, 2> jitter{};
+    {
+        std::scoped_lock lock(views_mutex_);
+        const auto generation = display_generation_.load();
+        if (!jitter_frame_ || *jitter_frame_ != frame_ || jitter_generation_ != generation) {
+            const std::uint32_t phase = jitter_index_++ % phase_count + 1;
+            frame_jitter_ = {halton(phase, 2) - 0.5f, halton(phase, 3) - 0.5f};
+            jitter_frame_ = frame_;
+            jitter_generation_ = generation;
+        }
 
-    *jitter_x = halton(phase, 2) - 0.5f;
-    *jitter_y = halton(phase, 3) - 0.5f;
+        jitter = frame_jitter_;
+    }
 
     *jittered_frustum = *frustum;
-    jittered_frustum->jitter_x = 2.0f * *jitter_x / static_cast<float>(render_width);
-    jittered_frustum->jitter_y = -2.0f * *jitter_y / static_cast<float>(render_height);
+    jittered_frustum->jitter_x = 2.0f * jitter[0] / static_cast<float>(render_width);
+    jittered_frustum->jitter_y = -2.0f * jitter[1] / static_cast<float>(render_height);
 
     game.build_frustum(jittered_frustum, &frustum->origin, &frustum->view, frustum->near_plane, frustum->far_plane,
                        frustum->fov_x, frustum->aspect, frustum->clip_bottom_left_x, frustum->clip_bottom_left_y,
@@ -163,40 +226,35 @@ bool DlssRenderer::build_jittered_frustum(const char* debug_name, const Frustum*
     return true;
 }
 
-void DlssRenderer::on_add_view(void* view, const char* debug_name, const Frustum* frustum, float jitter_x,
-                               float jitter_y) {
-    if (!view || !debug_name || !frustum) return;
+void DlssRenderer::on_add_view(void* view, const char* debug_name, const void* view_id, const Frustum* frustum,
+                               float jitter_ndc_x, float jitter_ndc_y) {
+    if (!view || !debug_name || !frustum || !readable(view_id, 12)) return;
 
-    const ViewMatrices matrices = {frustum->view_projection, frustum->inv_view_projection,
-                                   frustum->rev_z_view_projection, frustum->inv_rev_z_view_projection};
-    const std::uint64_t name_hash = hash_name(debug_name);
+    // The main world pass uses standard depth: clear 1, LESS_EQUAL, and the primary projection.
+    ViewMatrices matrices = {frustum->view_projection, frustum->inv_view_projection};
+    remove_jitter(matrices.view_projection, matrices.inv_view_projection, frustum->jitter_x, frustum->jitter_y);
+    ViewIdentity identity{hash_name(debug_name)};
+    // AddView consumes an eight-byte key and four-byte subkey, not the transient view pointer.
+    std::memcpy(&identity.key, view_id, sizeof(identity.key));
+    std::memcpy(&identity.subkey, static_cast<const std::byte*>(view_id) + 8, sizeof(identity.subkey));
 
     std::scoped_lock lock(views_mutex_);
 
-    const int call = view_calls_[name_hash]++;
-    const auto [it_history, inserted] = view_history_.try_emplace(
-        name_hash + static_cast<std::uint64_t>(call) * 0x9E3779B97F4A7C15ull, ViewHistory{frame_, matrices, matrices});
-    if (!inserted && it_history->second.frame != frame_) {
-        it_history->second.previous = it_history->second.current;
-        it_history->second.frame = frame_;
-    }
-
-    it_history->second.current = matrices;
-
     ViewRecord& record = views_[next_view_++ % views_.size()];
     record.view = view;
-    record.name_hash = name_hash;
+    record.identity = identity;
+    record.frame = frame_;
     record.depth_target = -1;
-    record.jitter_x = jitter_x;
-    record.jitter_y = jitter_y;
+    record.jitter_ndc_x = jitter_ndc_x;
+    record.jitter_ndc_y = jitter_ndc_y;
     record.current = matrices;
-    record.previous = it_history->second.previous;
+    record.camera = {frustum->origin, frustum->view,       frustum->fov_x,
+                     frustum->aspect, frustum->near_plane, frustum->far_plane};
 }
 
 void DlssRenderer::on_finish_rendering_views() {
     std::scoped_lock lock(views_mutex_);
     frame_++;
-    view_calls_.clear();
 }
 
 void DlssRenderer::on_add_upscale_layers(const UpscaleLayersContext* context) {
@@ -214,7 +272,7 @@ void DlssRenderer::on_add_upscale_layers(const UpscaleLayersContext* context) {
 
             record.depth_target = context->depth_target;
 
-            main_view_hash_ = record.name_hash;
+            main_view_hash_ = record.identity.name_hash;
             main_view = true;
             break;
         }
@@ -345,7 +403,7 @@ bool DlssRenderer::queue_dispatch(void* render_context, void* scene_layer, const
         }
     }
 
-    if (!has_record || record.depth_target == -1 || record.name_hash != main_view_hash_) return false;
+    if (!has_record || record.depth_target == -1 || record.identity.name_hash != main_view_hash_) return false;
 
     last_render_width_ = source.width;
     last_render_height_ = source.height;
@@ -375,12 +433,12 @@ bool DlssRenderer::queue_dispatch(void* render_context, void* scene_layer, const
     dispatch.settings = store().active();
     dispatch.display_generation = display_generation_;
 
-    const bool reverse_z = depth_convention_ != DepthConvention::Standard;
-    dispatch.inv_view_projection =
-        reverse_z ? record.current.inv_rev_z_view_projection : record.current.inv_view_projection;
-    dispatch.prev_view_projection = reverse_z ? record.previous.rev_z_view_projection : record.previous.view_projection;
-    dispatch.jitter_x = record.jitter_x;
-    dispatch.jitter_y = record.jitter_y;
+    dispatch.matrices = record.current;
+    dispatch.camera = record.camera;
+    dispatch.identity = record.identity;
+    dispatch.frame = record.frame;
+    dispatch.jitter_x = record.jitter_ndc_x * static_cast<float>(source.width) * 0.5f;
+    dispatch.jitter_y = record.jitter_ndc_y * static_cast<float>(source.height) * -0.5f;
     dispatch.has_matrices = true;
 
     if (!enabled && !feature_created_) return false;
@@ -468,9 +526,6 @@ void DlssRenderer::execute(ID3D11DeviceContext* device_context, const Dispatch& 
             release_parameters();
             motion_vectors_shader_.Reset();
             shader_constants_.Reset();
-            depth_readback_texture_.Reset();
-            depth_convention_ = DepthConvention::Unknown;
-            depth_readback_pending_ = false;
             fallback_ = {};
             rcas_ = {};
             fallback_ready_ = false;
@@ -484,6 +539,11 @@ void DlssRenderer::execute(ID3D11DeviceContext* device_context, const Dispatch& 
             rendered = execute_dlss(device_context, dispatch);
         } catch (const std::exception& error) {
             fail(error.what());
+        }
+
+        if (!rendered) {
+            reset_ = true;
+            evaluation_history_.reset();
         }
 
         if (!rendered && dispatch.fallback &&
@@ -562,17 +622,28 @@ bool DlssRenderer::evaluate(ID3D11DeviceContext* device_context, const Dispatch&
 
     if (!feature_ || feature_settings_.quality != dispatch.settings.quality ||
         feature_settings_.preset != dispatch.settings.preset || direct_color_ != direct_color ||
-        direct_output_ != direct_output ||
-        std::memcmp(&feature_source_viewport_, &source, sizeof(RenderViewport)) != 0 ||
-        std::memcmp(&feature_destination_viewport_, &destination, sizeof(RenderViewport)) != 0 ||
-        feature_color_desc_.Width != color_desc.Width || feature_color_desc_.Height != color_desc.Height ||
-        feature_color_desc_.Format != input_desc.Format || feature_output_desc_.Width != output_desc.Width ||
-        feature_output_desc_.Height != output_desc.Height || feature_output_desc_.Format != output_desc.Format) {
+        direct_output_ != direct_output || !same_viewport(feature_source_viewport_, source) ||
+        !same_viewport(feature_destination_viewport_, destination) || feature_color_desc_.Width != color_desc.Width ||
+        feature_color_desc_.Height != color_desc.Height || feature_color_desc_.Format != input_desc.Format ||
+        feature_output_desc_.Width != output_desc.Width || feature_output_desc_.Height != output_desc.Height ||
+        feature_output_desc_.Format != output_desc.Format) {
         release_feature();
 
         if (!create_feature(device_context, dispatch, input_desc, output_desc, direct_color, direct_output))
             return false;
     }
+
+    if (!valid_camera(dispatch.camera) || !std::isfinite(dispatch.jitter_x) || !std::isfinite(dispatch.jitter_y) ||
+        !std::isfinite(source.min_z) || !std::isfinite(source.max_z) || source.min_z < 0.0f || source.max_z > 1.0f ||
+        source.max_z <= source.min_z)
+        return false;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!evaluation_history_ || dispatch.identity != evaluation_history_->identity ||
+        dispatch.frame - evaluation_history_->frame != 1 ||
+        now - evaluation_history_->time > std::chrono::milliseconds(500) ||
+        camera_cut(dispatch.camera, evaluation_history_->camera))
+        reset_ = true;
 
     if (!dispatch_motion_vectors(device_context, dispatch)) return false;
 
@@ -606,6 +677,8 @@ bool DlssRenderer::evaluate(ID3D11DeviceContext* device_context, const Dispatch&
     }
 
     reset_ = false;
+    evaluation_history_ = EvaluationHistory{dispatch.matrices, dispatch.camera, dispatch.identity, dispatch.frame,
+                                            std::chrono::steady_clock::now()};
     feature_created_ = true;
 
     if (dispatch.settings.sharpness > 0.0f) {
@@ -624,11 +697,31 @@ bool DlssRenderer::evaluate(ID3D11DeviceContext* device_context, const Dispatch&
     }
 
     input_size_ = (static_cast<std::uint64_t>(source.width) << 32) | static_cast<std::uint32_t>(source.height);
-    detect_depth_convention(device_context, dispatch);
     return true;
 }
 
 bool DlssRenderer::dispatch_motion_vectors(ID3D11DeviceContext* device_context, const Dispatch& dispatch) {
+    const auto& inverse = dispatch.matrices.inv_view_projection;
+    if (!valid_matrix(inverse)) return false;
+
+    Matrix4 reprojection{};
+    if (reset_) {
+        for (int index = 0; index < 4; ++index) reprojection.m[index][index] = 1.0f;
+    } else {
+        const auto& previous = evaluation_history_->matrices.view_projection;
+        if (!valid_matrix(previous)) return false;
+        reprojection = multiply(previous, inverse);
+    }
+
+    const RenderViewport& source = dispatch.source_viewport;
+    const float jitter_x = 2.0f * dispatch.jitter_x / static_cast<float>(source.width);
+    const float jitter_y = -2.0f * dispatch.jitter_y / static_cast<float>(source.height);
+    // BuildFrustum applies a clip-space translation. Fold its inverse into the CPU product.
+    for (auto& row : reprojection.m)
+        row[3] = static_cast<float>(static_cast<double>(row[3]) - static_cast<double>(row[0]) * jitter_x -
+                                    static_cast<double>(row[1]) * jitter_y);
+    if (!valid_matrix(reprojection)) return false;
+
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (!dispatch.depth_view ||
         FAILED(device_context->Map(shader_constants_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -636,12 +729,11 @@ bool DlssRenderer::dispatch_motion_vectors(ID3D11DeviceContext* device_context, 
         return false;
     }
 
-    const RenderViewport& source = dispatch.source_viewport;
-    const ShaderConstants constants = {
-        multiply(dispatch.prev_view_projection, dispatch.inv_view_projection),
-        {static_cast<float>(source.top_left_x), static_cast<float>(source.top_left_y), static_cast<float>(source.width),
-         static_cast<float>(source.height)},
-        {1.0f, source.min_z, source.max_z, depth_convention_ != DepthConvention::Standard ? 1.0f : 0.0f}};
+    const ShaderConstants constants = {reprojection,
+                                       {static_cast<float>(source.top_left_x), static_cast<float>(source.top_left_y),
+                                        static_cast<float>(source.width), static_cast<float>(source.height)},
+                                       {reset_ ? 0.0f : 1.0f, source.min_z, source.max_z, 0.0f},
+                                       {jitter_x, jitter_y, 0.0f, 0.0f}};
 
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     device_context->Unmap(shader_constants_.Get(), 0);
@@ -666,43 +758,6 @@ bool DlssRenderer::dispatch_motion_vectors(ID3D11DeviceContext* device_context, 
     device_context->CSSetShader(nullptr, nullptr, 0);
 
     return true;
-}
-
-void DlssRenderer::detect_depth_convention(ID3D11DeviceContext* device_context, const Dispatch& dispatch) {
-    if (depth_convention_ != DepthConvention::Unknown || !dispatch.depth_view || !depth_readback_texture_) return;
-
-    if (dispatch.source_viewport.width < 32 || dispatch.source_viewport.height < 32) return;
-
-    if (!depth_readback_pending_) {
-        const RenderViewport& source = dispatch.source_viewport;
-        const UINT left = static_cast<UINT>(source.width / 2 - 16);
-        const UINT top = static_cast<UINT>(source.height / 2 - 16);
-        const D3D11_BOX box = {left, top, 0, left + 32, top + 32, 1};
-
-        device_context->CopySubresourceRegion(depth_readback_texture_.Get(), 0, 0, 0, 0, depth_texture_.Get(), 0, &box);
-        depth_readback_pending_ = true;
-        return;
-    }
-
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (device_context->Map(depth_readback_texture_.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) !=
-        S_OK)
-        return;
-
-    double sum = 0.0;
-    for (UINT y = 0; y < 32; y++) {
-        const float* row = reinterpret_cast<const float*>(static_cast<const std::uint8_t*>(mapped.pData) +
-                                                          static_cast<std::size_t>(y) * mapped.RowPitch);
-        for (UINT x = 0; x < 32; x++) sum += row[x];
-    }
-
-    device_context->Unmap(depth_readback_texture_.Get(), 0);
-    depth_readback_pending_ = false;
-
-    const double average = sum / (32.0 * 32.0);
-    depth_convention_ = average < 0.5 ? DepthConvention::Reversed : DepthConvention::Standard;
-
-    release_feature();
 }
 
 bool DlssRenderer::initialize_ngx() {
@@ -848,23 +903,6 @@ bool DlssRenderer::create_resources(ID3D11DeviceContext* device_context, const D
                                                  motion_vectors_view_.ReleaseAndGetAddressOf())))
         return false;
 
-    if (depth_convention_ == DepthConvention::Unknown) {
-        D3D11_TEXTURE2D_DESC readback_desc = {};
-        readback_desc.Width = 32;
-        readback_desc.Height = 32;
-        readback_desc.MipLevels = 1;
-        readback_desc.ArraySize = 1;
-        readback_desc.Format = DXGI_FORMAT_R32_FLOAT;
-        readback_desc.SampleDesc.Count = 1;
-        readback_desc.Usage = D3D11_USAGE_STAGING;
-        readback_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-        if (FAILED(device->CreateTexture2D(&readback_desc, nullptr, depth_readback_texture_.ReleaseAndGetAddressOf())))
-            return false;
-
-        depth_readback_pending_ = false;
-    }
-
     return true;
 }
 
@@ -880,10 +918,10 @@ bool DlssRenderer::create_feature(ID3D11DeviceContext* device_context, const Dis
 
     const RenderViewport& source = dispatch.source_viewport;
     const RenderViewport& destination = dispatch.destination_viewport;
-    const int create_flags = 2 | (depth_convention_ != DepthConvention::Standard ? 8 : 0);
+    constexpr int motion_vectors_low_res = 2;
     const auto preset = requested_preset(dispatch.settings);
 
-    ngx.set_i(parameters_, "DLSS.Feature.Create.Flags", create_flags);
+    ngx.set_i(parameters_, "DLSS.Feature.Create.Flags", motion_vectors_low_res);
     const bool output_subrect = direct_output_ && (destination.top_left_x != 0 || destination.top_left_y != 0 ||
                                                    static_cast<UINT>(destination.width) != output_desc.Width ||
                                                    static_cast<UINT>(destination.height) != output_desc.Height);
@@ -976,6 +1014,7 @@ void DlssRenderer::release_feature() {
     direct_color_ = false;
     direct_output_ = false;
     reset_ = true;
+    evaluation_history_.reset();
 }
 
 void DlssRenderer::release_parameters() {
